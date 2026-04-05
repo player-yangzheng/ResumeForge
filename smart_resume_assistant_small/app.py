@@ -7,8 +7,13 @@
 
 import os
 import json
+import uuid
+import threading
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, render_template, request, jsonify, flash, redirect, url_for
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
 from utils.interview_generator import InterviewQuestionGenerator
@@ -33,6 +38,15 @@ ALLOWED_EXTENSIONS = {'pdf', 'docx'}
 # 确保上传目录存在
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+# 限流配置
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://",
+    strategy="fixed-window"
+)
 
 # 大模型配置 - 优先级：config.py > 环境变量 > 默认配置
 LLM_CONFIG = {
@@ -69,6 +83,16 @@ try:
                     'secret_key': baidu_config['secret_key']
                 })
                 print("从配置文件加载百度文心一言配置成功")
+        elif provider == 'zhipu':
+            zhipu_config = CONFIG_LLM.get('zhipu', {})
+            if zhipu_config.get('api_key'):
+                LLM_CONFIG.update({
+                    'enabled': True,
+                    'provider': 'zhipu',
+                    'api_key': zhipu_config['api_key'],
+                    'model': zhipu_config.get('model', 'glm-4-flash')
+                })
+                print("从配置文件加载智谱AI配置成功")
 except ImportError:
     print("未找到config.py配置文件，使用默认配置")
 
@@ -93,6 +117,14 @@ if not LLM_CONFIG['enabled']:
             'secret_key': os.getenv('BAIDU_SECRET_KEY')
         })
         print("从环境变量加载百度文心一言配置成功")
+    elif os.getenv('ZHIPU_API_KEY'):
+        LLM_CONFIG.update({
+            'enabled': True,
+            'provider': 'zhipu',
+            'api_key': os.getenv('ZHIPU_API_KEY'),
+            'model': os.getenv('ZHIPU_MODEL', 'glm-4-flash')
+        })
+        print("从环境变量加载智谱AI配置成功")
 
 # 初始化大模型解析器
 llm_parser = None
@@ -107,10 +139,16 @@ if LLM_CONFIG['enabled']:
             print(f"通义千问解析器初始化成功，使用模型: {LLM_CONFIG.get('model', 'qwen-plus')}")
         elif LLM_CONFIG['provider'] == 'baidu':
             llm_parser = LLMParserFactory.create_baidu_parser(
-                LLM_CONFIG['api_key'], 
+                LLM_CONFIG['api_key'],
                 LLM_CONFIG['secret_key']
             )
             print("百度文心一言解析器初始化成功")
+        elif LLM_CONFIG['provider'] == 'zhipu':
+            llm_parser = LLMParserFactory.create_zhipu_parser(
+                LLM_CONFIG['api_key'],
+                LLM_CONFIG.get('model', 'glm-4-flash')
+            )
+            print(f"智谱AI解析器初始化成功，使用模型: {LLM_CONFIG.get('model', 'glm-4-flash')}")
     except Exception as e:
         print(f"大模型解析器初始化失败: {e}")
         llm_parser = None
@@ -130,6 +168,7 @@ def index():
     return render_template('index.html')
 
 @app.route('/upload', methods=['POST'])
+@limiter.limit("5 per minute")
 def upload_file():
     """处理文件上传和分析"""
     try:
@@ -177,11 +216,9 @@ def upload_file():
         
         # 处理文件名安全性
         filename = secure_filename(original_filename)
-        
-        # 生成新文件名，确保包含扩展名
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        base_name = filename.rsplit('.', 1)[0] if '.' in filename else filename
-        new_filename = f"{timestamp}_{base_name}{file_ext}"
+
+        # 使用UUID生成唯一文件名，避免并发冲突
+        new_filename = f"{uuid.uuid4().hex}{file_ext}"
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], new_filename)
         file.save(filepath)
         
@@ -194,143 +231,187 @@ def upload_file():
             resume_parser = ResumeParser()
             resume_text = resume_parser._extract_text(filepath)
             print(f"简历文本提取完成，长度: {len(resume_text) if resume_text else 0}")
-            
+
             if not resume_text or len(resume_text.strip()) < 50:
                 return jsonify({
                     'success': False,
                     'error': '无法提取简历内容或内容过短，请检查文件格式'
                 })
-            
-            # 解析简历 - 优先使用大模型
-            print("开始解析简历...")
-            resume_data = None
-            resume_success = False
-            resume_used_llm = False
-            
-            if llm_parser:
-                print("使用大模型解析简历...")
-                try:
-                    print(f"简历文本长度: {len(resume_text)}")
-                    resume_result = llm_parser.parse_resume(resume_text)
-                    print(f"大模型简历解析结果: success={resume_result.get('success')}, error={resume_result.get('error')}")
-                    if resume_result.get('success'):
-                        resume_data = resume_result.get('data', {})
-                        resume_success = True
-                        resume_used_llm = True
-                        print("大模型简历解析成功")
-                        print(f"解析得到的数据字段: {list(resume_data.keys()) if resume_data else 'None'}")
-                    else:
-                        print(f"大模型简历解析失败: {resume_result.get('error')}")
-                except Exception as e:
-                    print(f"大模型简历解析异常: {str(e)}")
-                    import traceback
-                    print(f"异常详情: {traceback.format_exc()}")
-            else:
-                print("LLM解析器未初始化，跳过大模型解析")
-            
-            # 如果大模型解析失败，使用传统解析器
-            if not resume_success:
-                print("使用传统方法解析简历...")
-                try:
-                    resume_data = resume_parser.parse_resume(filepath)
-                    resume_success = bool(resume_data)
-                    print(f"传统简历解析完成: {resume_data.keys() if resume_data else 'None'}")
-                except Exception as e:
-                    print(f"传统简历解析失败: {str(e)}")
-                    resume_data = {}
-                    resume_success = False
-            
-            # 解析JD - 优先使用大模型
-            print("开始解析职位描述...")
-            jd_data = None
-            jd_success = False
-            jd_used_llm = False
-            
-            if llm_parser:
-                print("使用大模型解析JD...")
-                try:
-                    print(f"JD文本长度: {len(jd_text)}")
-                    jd_result = llm_parser.parse_jd(jd_text)
-                    print(f"大模型JD解析结果: success={jd_result.get('success')}, error={jd_result.get('error')}")
-                    if jd_result.get('success'):
-                        jd_data = jd_result.get('data', {})
-                        jd_success = True
-                        jd_used_llm = True
-                        print("大模型JD解析成功")
-                        print(f"解析得到的数据字段: {list(jd_data.keys()) if jd_data else 'None'}")
-                    else:
-                        print(f"大模型JD解析失败: {jd_result.get('error')}")
-                except Exception as e:
-                    print(f"大模型JD解析异常: {str(e)}")
-                    import traceback
-                    print(f"异常详情: {traceback.format_exc()}")
-            else:
-                print("LLM解析器未初始化，跳过大模型JD解析")
-            
-            # 如果大模型解析失败，使用传统解析器
-            if not jd_success:
-                print("使用传统方法解析JD...")
-                try:
-                    jd_parser = JDParser()
-                    jd_result = jd_parser.parse_jd(jd_text)
-                    if jd_result.get('success'):
-                        jd_data = jd_result.get('data', {})
-                        jd_success = True
-                    print(f"传统JD解析完成: {jd_data.keys() if jd_data else 'None'}")
-                except Exception as e:
-                    print(f"传统JD解析失败: {str(e)}")
-                    jd_success = False
-            
+
+            # ---- 第一轮并行：解析简历 & 解析JD ----
+            def _parse_resume():
+                """解析简历，优先使用大模型"""
+                print("开始解析简历...")
+                resume_data = None
+                resume_success = False
+                resume_used_llm = False
+
+                if llm_parser:
+                    print("使用大模型解析简历...")
+                    try:
+                        print(f"简历文本长度: {len(resume_text)}")
+                        resume_result = llm_parser.parse_resume(resume_text)
+                        print(f"大模型简历解析结果: success={resume_result.get('success')}, error={resume_result.get('error')}")
+                        if resume_result.get('success'):
+                            resume_data = resume_result.get('data', {})
+                            resume_success = True
+                            resume_used_llm = True
+                            print("大模型简历解析成功")
+                            print(f"解析得到的数据字段: {list(resume_data.keys()) if resume_data else 'None'}")
+                        else:
+                            print(f"大模型简历解析失败: {resume_result.get('error')}")
+                    except Exception as e:
+                        print(f"大模型简历解析异常: {str(e)}")
+                        import traceback
+                        print(f"异常详情: {traceback.format_exc()}")
+                else:
+                    print("LLM解析器未初始化，跳过大模型解析")
+
+                if not resume_success:
+                    print("使用传统方法解析简历...")
+                    try:
+                        resume_data = resume_parser.parse_resume(filepath)
+                        resume_success = bool(resume_data)
+                        print(f"传统简历解析完成: {resume_data.keys() if resume_data else 'None'}")
+                    except Exception as e:
+                        print(f"传统简历解析失败: {str(e)}")
+                        resume_data = {}
+                        resume_success = False
+
+                return resume_data, resume_success, resume_used_llm
+
+            def _parse_jd():
+                """解析JD，优先使用大模型"""
+                print("开始解析职位描述...")
+                jd_data = None
+                jd_success = False
+                jd_used_llm = False
+
+                if llm_parser:
+                    print("使用大模型解析JD...")
+                    try:
+                        print(f"JD文本长度: {len(jd_text)}")
+                        jd_result = llm_parser.parse_jd(jd_text)
+                        print(f"大模型JD解析结果: success={jd_result.get('success')}, error={jd_result.get('error')}")
+                        if jd_result.get('success'):
+                            jd_data = jd_result.get('data', {})
+                            jd_success = True
+                            jd_used_llm = True
+                            print("大模型JD解析成功")
+                            print(f"解析得到的数据字段: {list(jd_data.keys()) if jd_data else 'None'}")
+                        else:
+                            print(f"大模型JD解析失败: {jd_result.get('error')}")
+                    except Exception as e:
+                        print(f"大模型JD解析异常: {str(e)}")
+                        import traceback
+                        print(f"异常详情: {traceback.format_exc()}")
+                else:
+                    print("LLM解析器未初始化，跳过大模型JD解析")
+
+                if not jd_success:
+                    print("使用传统方法解析JD...")
+                    try:
+                        jd_parser = JDParser()
+                        jd_result = jd_parser.parse_jd(jd_text)
+                        if jd_result.get('success'):
+                            jd_data = jd_result.get('data', {})
+                            jd_success = True
+                        print(f"传统JD解析完成: {jd_data.keys() if jd_data else 'None'}")
+                    except Exception as e:
+                        print(f"传统JD解析失败: {str(e)}")
+                        jd_success = False
+
+                return jd_data, jd_success, jd_used_llm
+
+            print("[并行] 开始并行解析简历和JD...")
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_resume = executor.submit(_parse_resume)
+                future_jd = executor.submit(_parse_jd)
+
+                resume_data, resume_success, resume_used_llm = future_resume.result()
+                jd_data, jd_success, jd_used_llm = future_jd.result()
+            print("[并行] 简历和JD解析完成")
+
             # 检查解析是否成功
             if not resume_success:
                 return jsonify({
                     'success': False,
                     'error': '简历解析失败，请检查文件格式和内容'
                 })
-            
+
             if not jd_success:
                 return jsonify({
                     'success': False,
                     'error': '职位描述解析失败，请检查JD内容'
                 })
-            
-            # 匹配分析 - 优先使用大模型
-            print("开始匹配分析...")
-            match_result = None
-            
-            if llm_parser:
-                print("使用大模型进行匹配分析...")
-                try:
-                    match_result = llm_parser.analyze_match(resume_data, jd_data)
-                    if match_result.get('success'):
-                        print("大模型匹配分析成功")
-                    else:
-                        print(f"大模型匹配分析失败: {match_result.get('error')}")
+
+            # ---- 第二轮并行：匹配分析 & 面试问题生成 ----
+            def _analyze_match():
+                """匹配分析，优先使用大模型"""
+                print("开始匹配分析...")
+                match_result = None
+
+                if llm_parser:
+                    print("使用大模型进行匹配分析...")
+                    try:
+                        match_result = llm_parser.analyze_match(resume_data, jd_data)
+                        if match_result.get('success'):
+                            print("大模型匹配分析成功")
+                        else:
+                            print(f"大模型匹配分析失败: {match_result.get('error')}")
+                            match_result = None
+                    except Exception as e:
+                        print(f"大模型匹配分析异常: {str(e)}")
                         match_result = None
-                except Exception as e:
-                    print(f"大模型匹配分析异常: {str(e)}")
-                    match_result = None
-            
-            # 如果大模型分析失败，使用传统分析器
-            if not match_result or not match_result.get('success'):
-                print("使用传统方法进行匹配分析...")
+
+                if not match_result or not match_result.get('success'):
+                    print("使用传统方法进行匹配分析...")
+                    try:
+                        analyzer = MatchAnalyzer()
+                        resume_for_analyzer = {'success': resume_success, 'data': resume_data}
+                        jd_for_analyzer = {'success': jd_success, 'data': jd_data}
+                        match_result = analyzer.analyze_match(resume_for_analyzer, jd_for_analyzer)
+                        print(f"传统匹配分析完成: {type(match_result)}")
+                    except Exception as e:
+                        print(f"传统匹配分析失败: {str(e)}")
+                        match_result = {'success': False, 'error': str(e)}
+
+                return match_result
+
+            def _gen_interview_questions():
+                """生成面试问题，优先使用大模型"""
+                print("开始生成面试问题...")
+                interviewgen = InterviewQuestionGenerator()
                 try:
-                    analyzer = MatchAnalyzer()
-                    # 构造正确的数据格式
-                    resume_for_analyzer = {'success': resume_success, 'data': resume_data}
-                    jd_for_analyzer = {'success': jd_success, 'data': jd_data}
-                    match_result = analyzer.analyze_match(resume_for_analyzer, jd_for_analyzer)
-                    print(f"传统匹配分析完成: {type(match_result)}")
+                    if llm_parser and resume_success and jd_success:
+                        print("使用大模型生成面试问题...")
+                        interview_questions = llm_parser.generate_interview_questions(resume_data, jd_data)
+                        print(f"大模型面试问题生成完成: {type(interview_questions)}")
+                    else:
+                        print("使用传统方法生成面试问题...")
+                        resume_for_interview = {'success': resume_success, 'data': resume_data}
+                        jd_for_interview = {'success': jd_success, 'data': jd_data}
+                        interview_questions = interviewgen.generate_interview_questions(resume_for_interview, jd_for_interview)
+                        print(f"传统面试问题生成完成: {type(interview_questions)}")
                 except Exception as e:
-                    print(f"传统匹配分析失败: {str(e)}")
-                    match_result = {'success': False, 'error': str(e)}
-            
-            # AI优化建议
+                    print(f"面试问题生成失败: {str(e)}")
+                    interview_questions = {'success': False, 'error': str(e)}
+
+                return interview_questions
+
+            print("[并行] 开始并行执行匹配分析和面试问题生成...")
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_match = executor.submit(_analyze_match)
+                future_interview = executor.submit(_gen_interview_questions)
+
+                match_result = future_match.result()
+                interview_questions = future_interview.result()
+            print("[并行] 匹配分析和面试问题生成完成")
+
+            # 优化建议（依赖 match_result，串行执行）
             print("开始生成优化建议...")
-            interviewgen=InterviewQuestionGenerator()
             optimizer = ResumeOptimizer()
             try:
-                # 构造优化建议生成器需要的数据格式
                 resume_for_optimizer = {'success': resume_success, 'data': resume_data}
                 jd_for_optimizer = {'success': jd_success, 'data': jd_data}
                 optimization_result = optimizer.generate_optimization_suggestions(match_result, resume_for_optimizer, jd_for_optimizer)
@@ -338,24 +419,6 @@ def upload_file():
             except Exception as e:
                 print(f"优化建议生成失败: {str(e)}")
                 optimization_result = {'success': False, 'error': str(e)}
-            
-            print("开始生成面试问题...")
-            try:
-                # 优先使用LLM生成带标准答案的面试问题
-                if llm_parser and resume_success and jd_success:
-                    print("使用大模型生成面试问题...")
-                    interview_questions = llm_parser.generate_interview_questions(resume_data, jd_data)
-                    print(f"大模型面试问题生成完成: {type(interview_questions)}")
-                else:
-                    print("使用传统方法生成面试问题...")
-                    # 构造面试问题生成器需要的数据格式
-                    resume_for_interview = {'success': resume_success, 'data': resume_data}
-                    jd_for_interview = {'success': jd_success, 'data': jd_data}
-                    interview_questions = interviewgen.generate_interview_questions(resume_for_interview, jd_for_interview)
-                    print(f"传统面试问题生成完成: {type(interview_questions)}")
-            except Exception as e:
-                print(f"面试问题生成失败: {str(e)}")
-                interview_questions = {'success': False, 'error': str(e)}
             
             # 构建返回结果
             print("构建返回结果...")
@@ -367,7 +430,7 @@ def upload_file():
             
             # 确定使用的解析方法
             print(f"解析方法判断: resume_used_llm={resume_used_llm}, jd_used_llm={jd_used_llm}")
-            parsing_method = "🤖 大模型解析" if (resume_used_llm and jd_used_llm) else "📋 传统规则解析"
+            parsing_method = "AI 大模型解析" if (resume_used_llm and jd_used_llm) else "传统规则解析"
             print(f"最终解析方法: {parsing_method}")
             
             result = {
@@ -466,11 +529,30 @@ def handle_file_too_large(error):
         'error': '文件大小超过16MB限制'
     }), 413
 
+@app.errorhandler(429)
+def rate_limit_exceeded(error):
+    """请求频率超限错误处理"""
+    return jsonify({
+        'success': False,
+        'error': '请求过于频繁，请稍后再试'
+    }), 429
+
 if __name__ == '__main__':
-    # 开发环境配置
-    app.run(
-        host='127.0.0.1',
-        port=5000,
-        debug=True,
-        threaded=True
-    )
+    # 环境区分配置
+    env = os.getenv('FLASK_ENV', 'development')
+    if env == 'production':
+        print("生产环境模式")
+        app.run(
+            host='0.0.0.0',
+            port=int(os.getenv('PORT', 5000)),
+            debug=False,
+            threaded=True
+        )
+    else:
+        print("开发环境模式")
+        app.run(
+            host='127.0.0.1',
+            port=5000,
+            debug=True,
+            threaded=True
+        )

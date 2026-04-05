@@ -1,6 +1,7 @@
 import re
 import json
 import requests
+import threading
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 import time
@@ -22,30 +23,38 @@ class LLMParser:
         self.config = config
         self.access_token = None
         self.token_expires_at = 0
-        
+        self._token_lock = threading.Lock()
+
     def _get_baidu_access_token(self) -> str:
-        """获取百度文心一言访问令牌"""
+        """获取百度文心一言访问令牌（双重检查锁定）"""
+        # 第一次检查：无锁快速路径
         if self.access_token and time.time() < self.token_expires_at:
             return self.access_token
-            
-        url = "https://aip.baidubce.com/oauth/2.0/token"
-        params = {
-            "grant_type": "client_credentials",
-            "client_id": self.config.api_key,
-            "client_secret": self.config.secret_key
-        }
-        
-        try:
-            response = requests.post(url, params=params, timeout=10)
-            result = response.json()
-            if "access_token" in result:
-                self.access_token = result["access_token"]
-                self.token_expires_at = time.time() + result.get("expires_in", 3600) - 300  # 提前5分钟刷新
+
+        # 加锁
+        with self._token_lock:
+            # 第二次检查：避免多线程同时刷新
+            if self.access_token and time.time() < self.token_expires_at:
                 return self.access_token
-            else:
-                raise Exception(f"获取访问令牌失败: {result}")
-        except Exception as e:
-            raise Exception(f"获取百度访问令牌失败: {str(e)}")
+
+            url = "https://aip.baidubce.com/oauth/2.0/token"
+            params = {
+                "grant_type": "client_credentials",
+                "client_id": self.config.api_key,
+                "client_secret": self.config.secret_key
+            }
+
+            try:
+                response = requests.post(url, params=params, timeout=10)
+                result = response.json()
+                if "access_token" in result:
+                    self.access_token = result["access_token"]
+                    self.token_expires_at = time.time() + result.get("expires_in", 3600) - 300  # 提前5分钟刷新
+                    return self.access_token
+                else:
+                    raise Exception(f"获取访问令牌失败: {result}")
+            except Exception as e:
+                raise Exception(f"获取百度访问令牌失败: {str(e)}")
     
     def _call_baidu_api(self, prompt: str, model: str = "ernie-speed") -> str:
         """调用百度文心一言API"""
@@ -110,12 +119,50 @@ class LLMParser:
             except Exception as e:
                 raise Exception(f"调用通义千问API失败: {str(e)}")
     
+    def _call_zhipu_api(self, prompt: str, model: str = "glm-4-flash") -> str:
+        """调用智谱AI API"""
+        url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+
+        payload = {
+            "model": self.config.model or model,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.1,
+            "top_p": 0.8
+        }
+
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {self.config.api_key}'
+        }
+
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=60)
+                result = response.json()
+                if "choices" in result and len(result["choices"]) > 0:
+                    return result["choices"][0]["message"]["content"]
+                else:
+                    raise Exception(f"API调用失败: {result}")
+            except requests.exceptions.Timeout as e:
+                if attempt < max_retries:
+                    print(f"智谱AI API超时，正在重试 ({attempt + 1}/{max_retries})...")
+                    continue
+                else:
+                    raise Exception(f"调用智谱AI API超时: {str(e)}")
+            except Exception as e:
+                raise Exception(f"调用智谱AI API失败: {str(e)}")
+
     def _call_llm_api(self, prompt: str) -> str:
         """调用大模型API"""
         if self.config.provider == "baidu":
             return self._call_baidu_api(prompt)
         elif self.config.provider == "qwen":
             return self._call_qwen_api(prompt)
+        elif self.config.provider == "zhipu":
+            return self._call_zhipu_api(prompt)
         else:
             raise NotImplementedError(f"暂不支持 {self.config.provider} 提供商")
     
@@ -423,7 +470,17 @@ class LLMParserFactory:
             model=model
         )
         return LLMParser(config)
-    
+
+    @staticmethod
+    def create_zhipu_parser(api_key: str, model: str = "glm-4-flash") -> LLMParser:
+        """创建智谱AI解析器"""
+        config = LLMConfig(
+            provider="zhipu",
+            api_key=api_key,
+            model=model
+        )
+        return LLMParser(config)
+
     @staticmethod
     def get_default_config() -> Dict[str, str]:
         """获取默认配置说明"""
@@ -439,5 +496,11 @@ class LLMParserFactory:
                 "signup_url": "https://dashscope.console.aliyun.com/",
                 "api_key": "在阿里云百炼平台获取API Key",
                 "models": ["qwen-plus", "qwen-turbo", "qwen-max", "qwen-max-latest"]
+            },
+            "zhipu": {
+                "description": "智谱AI - 支持多种模型：glm-4-flash(免费), glm-4-air, glm-4-plus等",
+                "signup_url": "https://open.bigmodel.cn/",
+                "api_key": "在智谱AI开放平台获取API Key",
+                "models": ["glm-4-flash", "glm-4-air", "glm-4-plus", "glm-4"]
             }
         }

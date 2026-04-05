@@ -350,6 +350,11 @@
 
                 // 检查HTTP状态码
                 if (!response.ok) {
+                    // 处理429限流错误
+                    if (response.status === 429) {
+                        showAlert('请求过于频繁', '您的请求过于频繁，请等待一分钟后重试。每人每分钟最多提交5次分析。');
+                        return;
+                    }
                     throw new Error(`HTTP错误: ${response.status} ${response.statusText}`);
                 }
 

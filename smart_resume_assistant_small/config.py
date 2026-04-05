@@ -6,8 +6,8 @@ LLM_CONFIG = {
     # 是否启用大模型解析（需要配置API密钥）
     'enabled': True,
     
-    # 大模型提供商：'baidu'（百度文心一言）或 'qwen'（阿里通义千问）
-    'provider': 'qwen',  # 推荐使用通义千问
+    # 大模型提供商：'baidu'（百度文心一言）、'qwen'（阿里通义千问）或 'zhipu'（智谱AI）
+    'provider': 'zhipu',
     
     # 百度文心一言配置
     # 获取地址：https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application
@@ -21,6 +21,13 @@ LLM_CONFIG = {
     'qwen': {
         'api_key': os.getenv('OPENAI_API_KEY'),
         'model': 'qwen-plus'  # 可选：qwen-plus, qwen-turbo, qwen-max, qwen-max-latest
+    },
+
+    # 智谱AI配置
+    # 获取地址：https://open.bigmodel.cn/
+    'zhipu': {
+        'api_key': 'your_zhipu_api_key_here',
+        'model': 'glm-4-flash'  # 可选：glm-4-flash(免费), glm-4-air, glm-4-plus, glm-4, glm-5
     }
 }
 
@@ -52,3 +59,8 @@ LLM_CONFIG = {
 # 百度文心一言：
 # - ERNIE-Speed-8K: RPM=300, TPM=300000
 # - ERNIE-Lite-8K: RPM=300, TPM=300000
+#
+# 智谱AI：
+# - glm-4-flash: 免费模型，适合日常使用
+# - glm-4-air: 性价比高，适合大多数场景
+# - glm-4-plus: 更强能力，适合复杂任务
