@@ -1,0 +1,9 @@
+Flask==2.3.3
+Werkzeug==2.3.7
+PyPDF2==3.0.1
+python-docx==0.8.11
+jieba
+requests==2.31.0
+# 大模型相关依赖
+dataclasses==0.6; python_version < '3.7'
+json5==0.9.14
